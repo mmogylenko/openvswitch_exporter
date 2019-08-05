@@ -2,7 +2,29 @@ openvswitch_exporter [![Build Status](https://travis-ci.org/digitalocean/openvsw
 ====================
 
 Command `openvswitch_exporter` implements a Prometheus exporter for Open
-vSwitch. Apache 2.0 licensed.
+vSwitch by DigitalOcean. Apache 2.0 licensed.
+
+Usage
+-----
+
+Fetch dependenices and build:
+```none
+➜  openvswitch_exporter git:(master) dep ensure
+➜  openvswitch_exporter git:(master) go build .
+➜  openvswitch_exporter git:(master) ll
+total 23352
+-rw-r--r--  1 user  staff   140B Aug  5 11:24 AUTHORS
+-rw-r--r--  1 user  staff   1.2K Aug  5 11:24 CONTRIBUTING.md
+-rw-r--r--  1 user  staff   3.6K Aug  5 12:03 Gopkg.lock
+-rw-r--r--  1 user  staff   824B Aug  5 12:00 Gopkg.toml
+-rw-r--r--  1 user  staff    10K Aug  5 11:24 LICENSE.md
+-rw-r--r--  1 user  staff   2.9K Aug  5 12:03 README.md
+-rw-r--r--  1 user  staff   1.8K Aug  5 11:55 main.go
+-rwxr-xr-x  1 user  staff    11M Aug  5 12:03 openvswitch_exporter
+drwxr-xr-x  4 user  staff   128B Aug  5 11:40 ovsexporter
+drwxr-xr-x  4 user  staff   128B Aug  5 12:03 vendor
+➜  openvswitch_exporter git:(master) 
+```
 
 Usage
 -----
