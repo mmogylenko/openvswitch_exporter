@@ -4,7 +4,7 @@ openvswitch_exporter [![Build Status](https://travis-ci.org/digitalocean/openvsw
 Command `openvswitch_exporter` implements a Prometheus exporter for Open
 vSwitch by DigitalOcean. Apache 2.0 licensed.
 
-Usage
+Build
 -----
 
 Fetch dependenices and build:
