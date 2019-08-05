@@ -1,3 +1,4 @@
-cmd/openvswitch_exporter/openvswitch_exporter
 *.test
 deploy.sh
+vendor/**
+build/**

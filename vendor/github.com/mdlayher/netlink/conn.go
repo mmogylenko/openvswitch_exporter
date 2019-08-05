@@ -2,27 +2,14 @@ package netlink
 
 import (
 	"errors"
-	"io"
 	"math/rand"
 	"os"
+	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"golang.org/x/net/bpf"
-)
-
-// Error messages which can be returned by Validate.
-var (
-	errMismatchedSequence = errors.New("mismatched sequence in netlink reply")
-	errMismatchedPID      = errors.New("mismatched PID in netlink reply")
-	errShortErrorMessage  = errors.New("not enough data for netlink error code")
-)
-
-// Errors which can be returned by a Socket that does not implement
-// all exposed methods of Conn.
-var (
-	errReadWriteCloserNotSupported = errors.New("raw read/write/closer not supported")
-	errMulticastGroupsNotSupported = errors.New("multicast groups not supported")
-	errBPFFiltersNotSupported      = errors.New("BPF filters not supported")
 )
 
 // A Conn is a connection to netlink.  A Conn can be used to send and
@@ -31,6 +18,10 @@ var (
 // A Conn is safe for concurrent use, but to avoid contention in
 // high-throughput applications, the caller should almost certainly create a
 // pool of Conns and distribute them among workers.
+//
+// A Conn is capable of manipulating netlink subsystems from within a specific
+// Linux network namespace, but special care must be taken when doing so. See
+// the documentation of Config for details.
 type Conn struct {
 	// sock is the operating system-specific implementation of
 	// a netlink sockets connection.
@@ -42,6 +33,13 @@ type Conn struct {
 
 	// pid is the PID assigned by netlink.
 	pid uint32
+
+	// d provides debugging capabilities for a Conn if not nil.
+	d *debugger
+
+	// mu serializes access to the netlink socket for the request/response
+	// transaction within Execute.
+	mu sync.RWMutex
 }
 
 // A Socket is an operating-system specific implementation of netlink
@@ -49,6 +47,7 @@ type Conn struct {
 type Socket interface {
 	Close() error
 	Send(m Message) error
+	SendMessages(m []Message) error
 	Receive() ([]Message, error)
 }
 
@@ -70,34 +69,68 @@ func Dial(family int, config *Config) (*Conn, error) {
 //
 // NewConn is primarily useful for tests. Most applications should use
 // Dial instead.
-func NewConn(c Socket, pid uint32) *Conn {
-	seq := rand.Uint32()
+func NewConn(sock Socket, pid uint32) *Conn {
+	// Seed the sequence number using a random number generator.
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	seq := r.Uint32()
+
+	// Configure a debugger if arguments are set.
+	var d *debugger
+	if len(debugArgs) > 0 {
+		d = newDebugger(debugArgs)
+	}
 
 	return &Conn{
-		sock: c,
+		sock: sock,
 		seq:  &seq,
 		pid:  pid,
+		d:    d,
 	}
 }
 
-// Close closes the connection.
-func (c *Conn) Close() error {
-	return c.sock.Close()
+// debug executes fn with the debugger if the debugger is not nil.
+func (c *Conn) debug(fn func(d *debugger)) {
+	if c.d == nil {
+		return
+	}
+
+	fn(c.d)
 }
 
-// Execute sends a single Message to netlink using Conn.Send, receives one or more
-// replies using Conn.Receive, and then checks the validity of the replies against
+// Close closes the connection. Close will unblock any concurrent calls to
+// Receive which are waiting on a response from the kernel.
+func (c *Conn) Close() error {
+	// Close does not acquire a lock because it must be able to interrupt any
+	// blocked system calls, such as when Receive is waiting on a multicast
+	// group message.
+	//
+	// We rely on the kernel to deal with concurrent operations to the netlink
+	// socket itself.
+	return newOpError("close", c.sock.Close())
+}
+
+// Execute sends a single Message to netlink using Send, receives one or more
+// replies using Receive, and then checks the validity of the replies against
 // the request using Validate.
 //
-// See the documentation of Conn.Send, Conn.Receive, and Validate for details about
+// Execute acquires a lock for the duration of the function call which blocks
+// concurrent calls to Send, SendMessages, and Receive, in order to ensure
+// consistency between netlink request/reply messages.
+//
+// See the documentation of Send, Receive, and Validate for details about
 // each function.
-func (c *Conn) Execute(m Message) ([]Message, error) {
-	req, err := c.Send(m)
+func (c *Conn) Execute(message Message) ([]Message, error) {
+	// Acquire the write lock and invoke the internal implementations of Send
+	// and Receive which require the lock already be held.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	req, err := c.lockedSend(message)
 	if err != nil {
 		return nil, err
 	}
 
-	replies, err := c.Receive()
+	replies, err := c.lockedReceive()
 	if err != nil {
 		return nil, err
 	}
@@ -109,44 +142,89 @@ func (c *Conn) Execute(m Message) ([]Message, error) {
 	return replies, nil
 }
 
-// Send sends a single Message to netlink.  In most cases, m.Header's Length,
+// SendMessages sends multiple Messages to netlink. The handling of
+// a Header's Length, Sequence and PID fields is the same as when
+// calling Send.
+func (c *Conn) SendMessages(messages []Message) ([]Message, error) {
+	// Wait for any concurrent calls to Execute to finish before proceeding.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for idx, m := range messages {
+		ml := nlmsgLength(len(m.Data))
+
+		// TODO(mdlayher): fine-tune this limit.
+		if ml > (1024 * 32) {
+			return nil, errors.New("netlink message data too large")
+		}
+
+		c.fixMsg(&messages[idx], ml)
+	}
+
+	c.debug(func(d *debugger) {
+		for _, m := range messages {
+			d.debugf(1, "send msgs: %+v", m)
+		}
+	})
+
+	if err := c.sock.SendMessages(messages); err != nil {
+		c.debug(func(d *debugger) {
+			d.debugf(1, "send msgs: err: %v", err)
+		})
+
+		return nil, newOpError("send-messages", err)
+	}
+
+	return messages, nil
+}
+
+// Send sends a single Message to netlink.  In most cases, a Header's Length,
 // Sequence, and PID fields should be set to 0, so they can be populated
 // automatically before the Message is sent.  On success, Send returns a copy
 // of the Message with all parameters populated, for later validation.
 //
-// If m.Header.Length is 0, it will be automatically populated using the
+// If Header.Length is 0, it will be automatically populated using the
 // correct length for the Message, including its payload.
 //
-// If m.Header.Sequence is 0, it will be automatically populated using the
+// If Header.Sequence is 0, it will be automatically populated using the
 // next sequence number for this connection.
 //
-// If m.Header.PID is 0, it will be automatically populated using a PID
+// If Header.PID is 0, it will be automatically populated using a PID
 // assigned by netlink.
-func (c *Conn) Send(m Message) (Message, error) {
-	ml := nlmsgLength(len(m.Data))
+func (c *Conn) Send(message Message) (Message, error) {
+	// Wait for any concurrent calls to Execute to finish before proceeding.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lockedSend(message)
+}
+
+// lockedSend implements Send, but must be called with c.mu acquired for reading.
+// We rely on the kernel to deal with concurrent reads and writes to the netlink
+// socket itself.
+func (c *Conn) lockedSend(message Message) (Message, error) {
+	ml := nlmsgLength(len(message.Data))
 
 	// TODO(mdlayher): fine-tune this limit.
 	if ml > (1024 * 32) {
 		return Message{}, errors.New("netlink message data too large")
 	}
 
-	if m.Header.Length == 0 {
-		m.Header.Length = uint32(nlmsgAlign(ml))
+	c.fixMsg(&message, ml)
+
+	c.debug(func(d *debugger) {
+		d.debugf(1, "send: %+v", message)
+	})
+
+	if err := c.sock.Send(message); err != nil {
+		c.debug(func(d *debugger) {
+			d.debugf(1, "send: err: %v", err)
+		})
+
+		return Message{}, newOpError("send", err)
 	}
 
-	if m.Header.Sequence == 0 {
-		m.Header.Sequence = c.nextSequence()
-	}
-
-	if m.Header.PID == 0 {
-		m.Header.PID = c.pid
-	}
-
-	if err := c.sock.Send(m); err != nil {
-		return Message{}, err
-	}
-
-	return m, nil
+	return message, nil
 }
 
 // Receive receives one or more messages from netlink.  Multi-part messages are
@@ -155,10 +233,31 @@ func (c *Conn) Send(m Message) (Message, error) {
 //
 // If any of the messages indicate a netlink error, that error will be returned.
 func (c *Conn) Receive() ([]Message, error) {
+	// Wait for any concurrent calls to Execute to finish before proceeding.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lockedReceive()
+}
+
+// lockedReceive implements Receive, but must be called with c.mu acquired for reading.
+// We rely on the kernel to deal with concurrent reads and writes to the netlink
+// socket itself.
+func (c *Conn) lockedReceive() ([]Message, error) {
 	msgs, err := c.receive()
 	if err != nil {
+		c.debug(func(d *debugger) {
+			d.debugf(1, "recv: err: %v", err)
+		})
+
 		return nil, err
 	}
+
+	c.debug(func(d *debugger) {
+		for _, m := range msgs {
+			d.debugf(1, "recv: %+v", m)
+		}
+	})
 
 	// When using nltest, it's possible for zero messages to be returned by receive.
 	if len(msgs) == 0 {
@@ -167,7 +266,7 @@ func (c *Conn) Receive() ([]Message, error) {
 
 	// Trim the final message with multi-part done indicator if
 	// present.
-	if m := msgs[len(msgs)-1]; m.Header.Flags&HeaderFlagsMulti != 0 && m.Header.Type == HeaderTypeDone {
+	if m := msgs[len(msgs)-1]; m.Header.Flags&Multi != 0 && m.Header.Type == Done {
 		return msgs[:len(msgs)-1], nil
 	}
 
@@ -177,11 +276,18 @@ func (c *Conn) Receive() ([]Message, error) {
 // receive is the internal implementation of Conn.Receive, which can be called
 // recursively to handle multi-part messages.
 func (c *Conn) receive() ([]Message, error) {
+	// NB: All non-nil errors returned from this function *must* be of type
+	// OpError in order to maintain the appropriate contract with callers of
+	// this package.
+	//
+	// This contract also applies to functions called within this function,
+	// such as checkMessage.
+
 	var res []Message
 	for {
 		msgs, err := c.sock.Receive()
 		if err != nil {
-			return nil, err
+			return nil, newOpError("receive", err)
 		}
 
 		// If this message is multi-part, we will need to perform an recursive call
@@ -189,70 +295,28 @@ func (c *Conn) receive() ([]Message, error) {
 		var multi bool
 
 		for _, m := range msgs {
-			// Is this a multi-part message and is it not done yet?
-			if m.Header.Flags&HeaderFlagsMulti != 0 && m.Header.Type != HeaderTypeDone {
-				multi = true
-			}
-
 			if err := checkMessage(m); err != nil {
 				return nil, err
 			}
-		}
 
-		if !multi {
-			// More messages waiting
-			res = append(res, msgs...)
-			break
+			// Does this message indicate a multi-part message?
+			if m.Header.Flags&Multi == 0 {
+				// No, check the next messages.
+				continue
+			}
+
+			// Does this message indicate the last message in a series of
+			// multi-part messages from a single read?
+			multi = m.Header.Type != Done
 		}
 
 		res = append(res, msgs...)
+
+		if !multi {
+			// No more messages coming.
+			return res, nil
+		}
 	}
-	return res, nil
-}
-
-// An fder is a Socket that supports retrieving its raw file descriptor.
-type fder interface {
-	Socket
-	FD() int
-}
-
-var _ io.ReadWriteCloser = &fileReadWriteCloser{}
-
-// A fileReadWriteCloser is a limited *os.File which only allows access to its
-// Read and Write methods.
-type fileReadWriteCloser struct {
-	f *os.File
-}
-
-// Read implements io.ReadWriteCloser.
-func (rwc *fileReadWriteCloser) Read(b []byte) (int, error) { return rwc.f.Read(b) }
-
-// Write implements io.ReadWriteCloser.
-func (rwc *fileReadWriteCloser) Write(b []byte) (int, error) { return rwc.f.Write(b) }
-
-// Close implements io.ReadWriteCloser.
-func (rwc *fileReadWriteCloser) Close() error { return rwc.f.Close() }
-
-// ReadWriteCloser returns a raw io.ReadWriteCloser backed by the connection
-// of the Conn.
-//
-// ReadWriteCloser is intended for advanced use cases, such as those that do
-// not involve standard netlink message passing.
-//
-// Once invoked, it is the caller's responsibility to ensure that operations
-// performed using Conn and the raw io.ReadWriteCloser do not conflict with
-// each other.  In almost all scenarios, only one of the two should be used.
-func (c *Conn) ReadWriteCloser() (io.ReadWriteCloser, error) {
-	fc, ok := c.sock.(fder)
-	if !ok {
-		return nil, errReadWriteCloserNotSupported
-	}
-
-	return &fileReadWriteCloser{
-		// Backing the io.ReadWriteCloser with an *os.File enables easy reading
-		// and writing without more system call boilerplate.
-		f: os.NewFile(uintptr(fc.FD()), "netlink"),
-	}, nil
 }
 
 // A groupJoinLeaver is a Socket that supports joining and leaving
@@ -265,38 +329,204 @@ type groupJoinLeaver interface {
 
 // JoinGroup joins a netlink multicast group by its ID.
 func (c *Conn) JoinGroup(group uint32) error {
-	gc, ok := c.sock.(groupJoinLeaver)
+	conn, ok := c.sock.(groupJoinLeaver)
 	if !ok {
-		return errMulticastGroupsNotSupported
+		return notSupported("join-group")
 	}
 
-	return gc.JoinGroup(group)
+	return newOpError("join-group", conn.JoinGroup(group))
 }
 
 // LeaveGroup leaves a netlink multicast group by its ID.
 func (c *Conn) LeaveGroup(group uint32) error {
-	gc, ok := c.sock.(groupJoinLeaver)
+	conn, ok := c.sock.(groupJoinLeaver)
 	if !ok {
-		return errMulticastGroupsNotSupported
+		return notSupported("leave-group")
 	}
 
-	return gc.LeaveGroup(group)
+	return newOpError("leave-group", conn.LeaveGroup(group))
 }
 
-// A bpfSetter is a Socket that supports setting BPF filters.
+// A bpfSetter is a Socket that supports setting and removing BPF filters.
 type bpfSetter interface {
 	Socket
 	bpf.Setter
+	RemoveBPF() error
 }
 
 // SetBPF attaches an assembled BPF program to a Conn.
 func (c *Conn) SetBPF(filter []bpf.RawInstruction) error {
-	bc, ok := c.sock.(bpfSetter)
+	conn, ok := c.sock.(bpfSetter)
 	if !ok {
-		return errBPFFiltersNotSupported
+		return notSupported("set-bpf")
 	}
 
-	return bc.SetBPF(filter)
+	return newOpError("set-bpf", conn.SetBPF(filter))
+}
+
+// RemoveBPF removes a BPF filter from a Conn.
+func (c *Conn) RemoveBPF() error {
+	conn, ok := c.sock.(bpfSetter)
+	if !ok {
+		return notSupported("remove-bpf")
+	}
+
+	return newOpError("remove-bpf", conn.RemoveBPF())
+}
+
+// A deadlineSetter is a Socket that supports setting deadlines.
+type deadlineSetter interface {
+	Socket
+	SetDeadline(time.Time) error
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+// SetDeadline sets the read and write deadlines associated with the connection.
+//
+// Deadline functionality is only supported on Go 1.12+. Calling this function
+// on older versions of Go will result in an error.
+func (c *Conn) SetDeadline(t time.Time) error {
+	conn, ok := c.sock.(deadlineSetter)
+	if !ok {
+		return notSupported("set-deadline")
+	}
+
+	return newOpError("set-deadline", conn.SetDeadline(t))
+}
+
+// SetReadDeadline sets the read deadline associated with the connection.
+//
+// Deadline functionality is only supported on Go 1.12+. Calling this function
+// on older versions of Go will result in an error.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	conn, ok := c.sock.(deadlineSetter)
+	if !ok {
+		return notSupported("set-read-deadline")
+	}
+
+	return newOpError("set-read-deadline", conn.SetReadDeadline(t))
+}
+
+// SetWriteDeadline sets the write deadline associated with the connection.
+//
+// Deadline functionality is only supported on Go 1.12+. Calling this function
+// on older versions of Go will result in an error.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	conn, ok := c.sock.(deadlineSetter)
+	if !ok {
+		return notSupported("set-write-deadline")
+	}
+
+	return newOpError("set-write-deadline", conn.SetWriteDeadline(t))
+}
+
+// A ConnOption is a boolean option that may be set for a Conn.
+type ConnOption int
+
+// Possible ConnOption values.  These constants are equivalent to the Linux
+// setsockopt boolean options for netlink sockets.
+const (
+	PacketInfo ConnOption = iota
+	BroadcastError
+	NoENOBUFS
+	ListenAllNSID
+	CapAcknowledge
+	ExtendedAcknowledge
+)
+
+// An optionSetter is a Socket that supports setting netlink options.
+type optionSetter interface {
+	Socket
+	SetOption(option ConnOption, enable bool) error
+}
+
+// SetOption enables or disables a netlink socket option for the Conn.
+func (c *Conn) SetOption(option ConnOption, enable bool) error {
+	conn, ok := c.sock.(optionSetter)
+	if !ok {
+		return notSupported("set-option")
+	}
+
+	return newOpError("set-option", conn.SetOption(option, enable))
+}
+
+// A bufferSetter is a Socket that supports setting connection buffer sizes.
+type bufferSetter interface {
+	Socket
+	SetReadBuffer(bytes int) error
+	SetWriteBuffer(bytes int) error
+}
+
+// SetReadBuffer sets the size of the operating system's receive buffer
+// associated with the Conn.
+func (c *Conn) SetReadBuffer(bytes int) error {
+	conn, ok := c.sock.(bufferSetter)
+	if !ok {
+		return notSupported("set-read-buffer")
+	}
+
+	return newOpError("set-read-buffer", conn.SetReadBuffer(bytes))
+}
+
+// SetWriteBuffer sets the size of the operating system's transmit buffer
+// associated with the Conn.
+func (c *Conn) SetWriteBuffer(bytes int) error {
+	conn, ok := c.sock.(bufferSetter)
+	if !ok {
+		return notSupported("set-write-buffer")
+	}
+
+	return newOpError("set-write-buffer", conn.SetWriteBuffer(bytes))
+}
+
+// A filer is a Socket that supports retrieving its associated *os.File.
+type filer interface {
+	Socket
+	File() *os.File
+}
+
+var _ syscall.Conn = &Conn{}
+
+// TODO(mdlayher): mutex or similar to enforce syscall.RawConn contract of
+// FD remaining valid for duration of calls?
+
+// SyscallConn returns a raw network connection. This implements the
+// syscall.Conn interface.
+//
+// On Go 1.12+, all methods of the returned syscall.RawConn are supported and
+// the Conn is integrated with the runtime network poller. On versions of Go
+// prior to Go 1.12, only the Control method of the returned syscall.RawConn
+// is implemented.
+//
+// SyscallConn is intended for advanced use cases, such as getting and setting
+// arbitrary socket options using the netlink socket's file descriptor.
+//
+// Once invoked, it is the caller's responsibility to ensure that operations
+// performed using Conn and the syscall.RawConn do not conflict with
+// each other.
+func (c *Conn) SyscallConn() (syscall.RawConn, error) {
+	fc, ok := c.sock.(filer)
+	if !ok {
+		return nil, notSupported("syscall-conn")
+	}
+
+	return newRawConn(fc.File())
+}
+
+// fixMsg updates the fields of m using the logic specified in Send.
+func (c *Conn) fixMsg(m *Message, ml int) {
+	if m.Header.Length == 0 {
+		m.Header.Length = uint32(nlmsgAlign(ml))
+	}
+
+	if m.Header.Sequence == 0 {
+		m.Header.Sequence = c.nextSequence()
+	}
+
+	if m.Header.PID == 0 {
+		m.Header.PID = c.pid
+	}
 }
 
 // nextSequence atomically increments Conn's sequence number and returns
@@ -313,7 +543,7 @@ func Validate(request Message, replies []Message) error {
 		//   - request had no sequence, meaning we are probably validating
 		//     a multicast reply
 		if m.Header.Sequence != request.Header.Sequence && request.Header.Sequence != 0 {
-			return errMismatchedSequence
+			return newOpError("validate", errMismatchedSequence)
 		}
 
 		// Check for mismatched PID, unless:
@@ -322,7 +552,7 @@ func Validate(request Message, replies []Message) error {
 		//     - netlink has not yet assigned us a PID
 		//   - response had no PID, meaning it's from the kernel as a multicast reply
 		if m.Header.PID != request.Header.PID && request.Header.PID != 0 && m.Header.PID != 0 {
-			return errMismatchedPID
+			return newOpError("validate", errMismatchedPID)
 		}
 	}
 
@@ -335,13 +565,22 @@ type Config struct {
 	// no multicast group subscriptions will be made.
 	Groups uint32
 
-	// Experimental: do not lock the internal system call handling goroutine
-	// to its OS thread.  This may result in a speed-up of system call handling,
-	// but may cause unexpected behavior when sending and receiving a large number
-	// of messages.
+	// NetNS specifies the network namespace the Conn will operate in.
 	//
-	// This should almost certainly be set to false, but if you come up with a
-	// valid reason for using this, please file an issue at
-	// https://github.com/mdlayher/netlink to discuss your thoughts.
-	NoLockThread bool
+	// If set (non-zero), Conn will enter the specified network namespace and
+	// an error will occur in Dial if the operation fails.
+	//
+	// If not set (zero), a best-effort attempt will be made to enter the
+	// network namespace of the calling thread: this means that any changes made
+	// to the calling thread's network namespace will also be reflected in Conn.
+	// If this operation fails (due to lack of permissions or because network
+	// namespaces are disabled by kernel configuration), Dial will not return
+	// an error, and the Conn will operate in the default network namespace of
+	// the process. This enables non-privileged use of Conn in applications
+	// which do not require elevated privileges.
+	//
+	// Entering a network namespace is a privileged operation (root or
+	// CAP_SYS_ADMIN are required), and most applications should leave this set
+	// to 0.
+	NetNS int
 }
