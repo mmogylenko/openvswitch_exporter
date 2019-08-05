@@ -21,14 +21,6 @@
   revision = "6de2edd48e714588a82342011a8d3ceaea82b3e9"
 
 [[projects]]
-  branch = "master"
-  digest = "1:720a1463f821dbbace8f00d6c079d864857edb397eb0f5aa6aafabda9f3efbd4"
-  name = "github.com/digitalocean/openvswitch_exporter"
-  packages = ["internal/ovsexporter"]
-  pruneopts = "UT"
-  revision = "2ae6f29e4e50c4d0989a5ce4bab67c9f7cf3ff09"
-
-[[projects]]
   digest = "1:573ca21d3669500ff845bdebee890eb7fc7f0f50c59f2132f2a0c6b03d85086a"
   name = "github.com/golang/protobuf"
   packages = ["proto"]
@@ -130,7 +122,6 @@
   analyzer-version = 1
   input-imports = [
     "github.com/digitalocean/go-openvswitch/ovsnl",
-    "github.com/digitalocean/openvswitch_exporter/internal/ovsexporter",
     "github.com/prometheus/client_golang/prometheus",
     "github.com/prometheus/client_golang/prometheus/promhttp",
   ]

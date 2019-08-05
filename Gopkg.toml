@@ -23,13 +23,15 @@
 #   non-go = false
 #   go-tests = true
 #   unused-packages = true
+
+
 [[constraint]]
   branch = "master"
   name = "github.com/digitalocean/go-openvswitch"
 
 [[constraint]]
-  branch = "master"
-  name = "github.com/digitalocean/openvswitch_exporter"
+  name = "github.com/prometheus/client_golang"
+  version = "1.1.0"
 
 [prune]
   go-tests = true
